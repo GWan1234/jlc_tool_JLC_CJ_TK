@@ -1,53 +1,95 @@
-# GitHub Actions workflow — 仅在 push 的提交备注包含 "版本发布" 时触发
-# 环境变量（请在仓库 Settings -> Secrets 中添加）
-# - SCRIPT_CAT_WEBHOOK_URL: ScriptCat webhook 地址（不含 key 的情况）
-# - SCRIPT_CAT_WEBHOOK_KEY: ScriptCat 的密钥（如果 webhook URL 已包含 key，可留空）
-# - WECHAT_WORK_WEBHOOK_URL: 企业微信机器人 webhook 地址
-
-name: ScriptCat Publish Notifier
+# GitHub Actions workflow
+# 仅在 push 的提交备注包含 "版本发布" 时触发
+# 注意：仓库 Settings -> Webhooks 中配置的接收方 webhook Actions 无法读取。
+# 请把企业微信机器人的 webhook URL 保存到仓库 Secrets（Settings -> Secrets and variables -> Actions）
+# 建议的 secret 名称：WECHAT_WORK_WEBHOOK_URL
+name: ScriptCat Publish Notifier (WeChat only)
 
 on:
   push: {}
 
 jobs:
-  notify-scriptcat:
-    name: Notify ScriptCat and WeChat
+  notify-wechat:
+    name: Notify WeChat Work (企业微信)
     runs-on: ubuntu-latest
     # 仅在 push 的 head_commit.message 包含 "版本发布" 时执行
     if: ${{ github.event.head_commit != null && contains(github.event.head_commit.message, '版本发布') }}
     env:
-      WECHAT_WORK_WEBHOOK_URL: ${{ secrets.WECHAT_WEBHOOK }}
-
+      WECHAT_WORK_WEBHOOK_URL: ${{ secrets.WECHAT_WORK_WEBHOOK_URL }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Get last commit message
+        id: commit
+        run: |
+          set -euo pipefail
+
+          commit_message=""
+
+          # 如果 GITHUB_EVENT_PATH 存在且包含 head_commit.message，优先使用它
+          if [ -n "${GITHUB_EVENT_PATH:-}" ] && [ -f "${GITHUB_EVENT_PATH}" ]; then
+            if command -v jq >/dev/null 2>&1; then
+              commit_message=$(jq -r '.head_commit.message // ""' "${GITHUB_EVENT_PATH}")
+            else
+              # 如果没有 jq，使用 python 解析为后备（runner 上通常有 python）
+              commit_message=$(python - <<'PY'
+          import json,sys
+          p=sys.argv[1]
+          try:
+            e=json.load(open(p))
+            print(e.get("head_commit",{}).get("message",""))
+          except:
+            print("")
+          PY
+          "${GITHUB_EVENT_PATH}")
+                      fi
+                    fi
+
+          # 若仍为空，则从 git log 读取最后一次提交信息
+          if [ -z "$commit_message" ]; then
+            commit_message=$(git log -1 --pretty=%B || echo "")
+          fi
+
+          # 删除回车等不可见字符（避免输出问题）
+          commit_message=$(printf '%s' "$commit_message" | sed 's/\r//g')
+
+          # 使用多行输出格式写入 ACTIONS 输出
+          printf '%s\n' "commit_message<<'EOF'" >> "$GITHUB_OUTPUT"
+          printf '%s\n' "%s" "$commit_message" >> "$GITHUB_OUTPUT"
+          printf '%s\n' "EOF" >> "$GITHUB_OUTPUT"
 
       - name: Send concise message to WeChat Work
         id: wechat
         run: |
           set -euo pipefail
 
-          status="${{ steps.scriptcat.outputs.scriptcat_status }}"
-
-          # 判断是否为 2xx 响应
-          if echo "$status" | grep -E '^[23][0-9][0-9]$' >/dev/null; then
-            result="成功"
-          else
-            result="失败"
+          # 从 job env 读取 webhook（请把企业微信 webhook 存为 repo secret WECHAT_WORK_WEBHOOK_URL）
+          if [ -z "${WECHAT_WORK_WEBHOOK_URL:-}" ]; then
+            echo "WARN: WECHAT_WORK_WEBHOOK_URL is empty. Skipping notify."
+            exit 0
           fi
 
           short_sha=$(echo "${GITHUB_SHA}" | cut -c1-7)
-          content="ScriptCat 推送${result} (HTTP ${status}) — ${GITHUB_REPOSITORY}@${short_sha}"
+          repo="${GITHUB_REPOSITORY}"
+          commit_message="${{ steps.commit.outputs.commit_message }}"
 
-          # 企业微信机器人要求的 payload 格式（text）
+          # 去掉首尾多余空行
+          commit_message="$(printf '%s' "$commit_message" | sed '1{/^$/d};:a;/^$/{$d;N;ba};s/[[:space:]]*$//')"
+
+          content="ScriptCat 推送成功 — ${repo}@${short_sha}\n提交信息: ${commit_message}"
+
+          # 企业微信机器人的 payload（text 类型）
           wechat_payload=$(jq -n --arg c "$content" '{msgtype:"text", text:{content:$c}}')
 
-          curl -s -X POST "${WECHAT_WORK_WEBHOOK_URL}" \
+          # 发送请求（不让失败影响整个 workflow）
+          http_code=$(curl -s -o /dev/null -w "%{http_code}" -X POST "${WECHAT_WORK_WEBHOOK_URL}" \
             -H "Content-Type: application/json" \
-            -d "$wechat_payload" || true
+            -d "$wechat_payload" || echo "000")
 
-      - name: Fail job if ScriptCat failed (可选)
-        if: ${{ !startsWith(steps.scriptcat.outputs.scriptcat_status, '2') }}
+          echo "wechat_http_code=$http_code" >> "$GITHUB_OUTPUT"
+
+      - name: show wechat http code (optional)
+        if: always()
         run: |
-          echo "ScriptCat webhook 返回非 2xx 状态: ${{ steps.scriptcat.outputs.scriptcat_status }}"
-          exit 1
+          echo "WeChat HTTP status: ${{ steps.wechat.outputs.wechat_http_code }}"

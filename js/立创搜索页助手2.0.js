@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JLC_SHOP_SEARCH_TOOL_2.0
 // @namespace    http://tampermonkey.net/
-// @version      2.1.5
+// @version      2.1.6
 // @description  立创商城搜索页助手2.0
 // @author       Lx
 // @match        https://so.szlcsc.com/global.html**
@@ -1719,6 +1719,7 @@
                 }
               </style>`);
                 $('body').prepend(`
+                    <button id="switchBrandPageBtn" class="floating-button" style="bottom: 80px; margin-bottom: 10px;">切换旧品牌页</button>
                     <button id="searchListButton" show="false" class="floating-button">排序列表</button>
                     <!-- 卡片容器 -->
                     <div id="cardContainer" class="floating-card">
@@ -1811,6 +1812,20 @@
 
                 this.btnStatus = true;
             }
+
+            // 切换品牌页按钮事件（页面级别）
+            $('#switchBrandPageBtn').off('click').on('click', function() {
+                const currentUrl = window.location.href;
+                let newUrl;
+                if (currentUrl.includes('/brand_page/')) {
+                    newUrl = currentUrl.replace('/brand_page/', '/brand/');
+                } else if (currentUrl.includes('/brand/')) {
+                    newUrl = currentUrl.replace('/brand/', '/brand_page/');
+                }
+                if (newUrl) {
+                    window.location.href = newUrl;
+                }
+            });
         }
 
         /**
