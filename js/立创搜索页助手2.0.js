@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JLC_SHOP_SEARCH_TOOL_2.0
 // @namespace    http://tampermonkey.net/
-// @version      2.1.6
+// @version      2.1.8
 // @description  立创商城搜索页助手2.0
 // @author       Lx
 // @match        https://so.szlcsc.com/global.html**
@@ -1003,30 +1003,44 @@
         /**
          * 搜索列表中，对品牌颜色进行上色
          * list.szlcsc.com/catalog
+         * 优化：只处理未标记的元素，遍历DOM而非遍历品牌Map
          */
         static catalogBrandColor() {
+            // 只查询未处理的元素
+            const $unprocessed = $('div[title], li[title], span[title], a.brand-name[title]')
+                .not('[data-brand-colored]');
+
+            if ($unprocessed.length === 0) return;
+
             const brands = Array.from(Base.allOneCouponMap.entries());
             let index = 0;
 
             function processBatch() {
-                const batchSize = 10; // 每帧处理10个品牌
-                const end = Math.min(index + batchSize, brands.length);
+                const batchSize = 20; // 每帧处理20个元素
+                const elements = $unprocessed.toArray();
+                const end = Math.min(index + batchSize, elements.length);
 
                 for (; index < end; index++) {
-                    const [brandName, brandDetail] = brands[index];
-                    const $brandEle = $(`div[title*="${brandName}"], li[title*="${brandName}"], span[title*="${brandName}"], a.brand-name[title*="${brandName}"]`)
-                        .not('[style*="background-color"]')
-                        .not('.isNew, .isNotNew');
+                    const el = elements[index];
+                    const $el = $(el);
+                    const title = $el.prop('title') || '';
 
-                    if ($brandEle.length > 0) {
-                        $brandEle.prop('title', $brandEle.prop('title') + `（${brandDetail.isNew ? '新人券' : '非新人券'}）`);
-                        $brandEle.css({
-                            "background-color": brandDetail.isNew ? '#00bfffb8' : '#7fffd4b8'
-                        }).addClass(brandDetail.isNew ? 'isNew' : 'isNotNew');
+                    // 标记为已处理，避免重复查询
+                    $el.attr('data-brand-colored', 'true');
+
+                    // 在内存中匹配品牌
+                    for (const [brandName, brandDetail] of brands) {
+                        if (title.includes(brandName)) {
+                            $el.prop('title', title + `（${brandDetail.isNew ? '新人券' : '非新人券'}）`);
+                            $el.css({
+                                "background-color": brandDetail.isNew ? '#00bfffb8' : '#7fffd4b8'
+                            }).addClass(brandDetail.isNew ? 'isNew' : 'isNotNew');
+                            break; // 找到匹配就退出
+                        }
                     }
                 }
 
-                if (index < brands.length) {
+                if (index < elements.length) {
                     requestAnimationFrame(processBatch);
                 }
             }
@@ -1383,6 +1397,8 @@
         static cachedFilterParams = null;
         // 缓存的筛选参数（搜索页）
         static cachedSearchFilterParams = null;
+        // 缓存的筛选参数（分类页）
+        static cachedCatalogFilterParams = null;
 
         // 初始化默认选中状态
         static defaultTabs = {
@@ -1396,6 +1412,7 @@
         static initRequestInterceptor() {
             const brandTargetUrl = 'list.szlcsc.com/brand/product';
             const searchTargetUrl = 'so.szlcsc.com/query/product';
+            const catalogTargetUrl = 'list.szlcsc.com/parameter';
 
             // 拦截 XMLHttpRequest
             const originalXhrOpen = XMLHttpRequest.prototype.open;
@@ -1427,6 +1444,17 @@
                     }
                 }
 
+                // 分类页 POST 请求拦截
+                if (this._url && this._url.includes(catalogTargetUrl) && this._method?.toUpperCase() === 'POST') {
+                    try {
+                        const params = typeof body === 'string' ? JSON.parse(body) : body;
+                        SearchListHelper.cachedCatalogFilterParams = params;
+                        console.log('[筛选拦截-分类页] 缓存参数:', params);
+                    } catch (e) {
+                        console.warn('[筛选拦截-分类页] 解析请求体失败:', e);
+                    }
+                }
+
                 return originalXhrSend.apply(this, [body]);
             };
 
@@ -1455,10 +1483,22 @@
                     }
                 }
 
+                // 分类页 POST 请求拦截
+                if (urlStr.includes(catalogTargetUrl) && options.method?.toUpperCase() === 'POST') {
+                    try {
+                        const body = options.body;
+                        const params = typeof body === 'string' ? JSON.parse(body) : body;
+                        SearchListHelper.cachedCatalogFilterParams = params;
+                        console.log('[筛选拦截-分类页] (fetch) 缓存参数:', params);
+                    } catch (e) {
+                        console.warn('[筛选拦截-分类页] 解析请求体失败:', e);
+                    }
+                }
+
                 return originalFetch.apply(this, [url, options]);
             };
 
-            console.log('[筛选拦截] 请求拦截器已初始化 (品牌页+搜索页)');
+            console.log('[筛选拦截] 请求拦截器已初始化 (品牌页+搜索页+分类页)');
         }
 
         constructor() {
@@ -1481,10 +1521,17 @@
 
             // 根据页面类型选择不同的数据获取方式
             const isSearchPage = location.href.includes('so.szlcsc.com');
+            const isCatalogPage = location.href.includes('list.szlcsc.com/catalog');
 
             if (isSearchPage) {
                 // 搜索页使用 getSearchProducts 方法
                 SearchListHelper.listData = await SearchListHelper.getSearchProducts(brandsNameOrSearchText, maxCount, onProgress);
+            } else if (isCatalogPage) {
+                // 分类页使用 getCatalogProducts 方法
+                // 从URL中提取catalogId，例如 /catalog/381.html -> 381
+                const catalogMatch = location.href.match(/\/catalog\/(\d+)/);
+                const catalogId = catalogMatch ? catalogMatch[1] : '';
+                SearchListHelper.listData = await SearchListHelper.getCatalogProducts(catalogId, maxCount, onProgress);
             } else {
                 // 品牌页使用 getBrandsProducts_new 方法
                 SearchListHelper.listData = await SearchListHelper.getBrandsProducts_new(brandsNameOrSearchText, brandsId, maxCount, stock, onProgress);
@@ -1563,6 +1610,99 @@
                         if (!res) return reject('获取搜索商品列表失败');
                         res = typeof res === 'object' ? res : JSON.parse(res);
                         if (!res.code || res.code !== 200) return reject(res.msg || '获取搜索商品列表失败');
+                        const list = res?.result?.searchResult?.productRecordList;
+                        if (!list || list.length === 0) {
+                            if (onProgress) onProgress({ loaded: counts, page: page, status: 'done' });
+                            return resolve(products);
+                        }
+                        products = products.concat(list);
+                        counts += list.length;
+                        if (maxCount && counts >= maxCount) {
+                            if (onProgress) onProgress({ loaded: counts, page: page, status: 'done' });
+                            return resolve(products);
+                        }
+                        getData(page + 1);
+                    }).catch(err => {
+                        reject(err);
+                    });
+                };
+                getData(1);
+            });
+        }
+
+        /**
+         * 获取分类页商品列表（使用缓存的筛选参数）
+         * @param catalogId 分类ID
+         * @param maxCount 最大商品数量
+         * @param onProgress 进度回调函数
+         * @returns {Promise<Array>}
+         */
+        static getCatalogProducts(catalogId, maxCount = null, onProgress = null) {
+            return new Promise((resolve, reject) => {
+                const url = 'https://list.szlcsc.com/category/product';
+                let products = [];
+                let counts = 0;
+
+                const getData = (page) => {
+                    // 触发进度回调
+                    if (onProgress) {
+                        onProgress({ loaded: counts, page: page, status: 'loading' });
+                    }
+
+                    // 默认参数
+                    let data = {
+                        "currentPage": page,
+                        "pageSize": 30,
+                        "catalogIdFilter": catalogId || "",
+                        "brandIdFilter": "",
+                        "standardFilter": "",
+                        "brandPlaceFilter": "",
+                        "brandOriginFilter": "",
+                        "labelFilter": "",
+                        "arrangeFilter": "",
+                        "smtLabelFilter": "",
+                        "spotFilter": 1,
+                        "discountFilter": 1,
+                        "startPrice": "",
+                        "endPrice": "",
+                        "sortNumber": 0,
+                        "queryParameterValue": "",
+                        "lastParamName": "",
+                        "keyword": "",
+                        "secondKeyword": "",
+                        "hasDataFile": false,
+                        "demandNumber": "",
+                        "satisfyStockType": "",
+                        "queryProductTypeCode": "",
+                        "authenticationFilter": ""
+                    };
+
+                    // 如果有缓存的筛选参数，合并到请求参数中
+                    if (SearchListHelper.cachedCatalogFilterParams) {
+                        const cached = SearchListHelper.cachedCatalogFilterParams;
+                        data = {
+                            ...data,
+                            catalogIdFilter: cached.catalogIdFilter || catalogId || "",
+                            brandIdFilter: cached.brandIdFilter || "",
+                            standardFilter: cached.standardFilter || "",
+                            brandPlaceFilter: cached.brandPlaceFilter || "",
+                            brandOriginFilter: cached.brandOriginFilter || "",
+                            labelFilter: cached.labelFilter || "",
+                            arrangeFilter: cached.arrangeFilter || "",
+                            smtLabelFilter: cached.smtLabelFilter || "",
+                            startPrice: cached.startPrice || "",
+                            endPrice: cached.endPrice || "",
+                            queryParameterValue: cached.queryParameterValue || "",
+                            lastParamName: cached.lastParamName || "",
+                            authenticationFilter: cached.authenticationFilter || ""
+                        };
+                        console.log('[筛选同步-分类页] 使用缓存的筛选参数:', data);
+                    }
+
+                    Util.postAjaxJSON(url, data).then(res => {
+                        if (!res) return reject('获取分类商品列表失败');
+                        res = typeof res === 'object' ? res : JSON.parse(res);
+                        if (!res.code || res.code !== 200) return reject(res.msg || '获取分类商品列表失败');
                         const list = res?.result?.searchResult?.productRecordList;
                         if (!list || list.length === 0) {
                             if (onProgress) onProgress({ loaded: counts, page: page, status: 'done' });
@@ -2657,6 +2797,16 @@
 
     // 分类品牌颜色定时器开启状态，默认false
     let catalogBrandColorTaskIsStartStatus = false;
+    let catalogBrandColorObserver = null;
+
+    // 防抖函数
+    function debounce(fn, delay) {
+        let timer = null;
+        return function (...args) {
+            if (timer) clearTimeout(timer);
+            timer = setTimeout(() => fn.apply(this, args), delay);
+        };
+    }
 
     // 搜索页启动
     function searchStart() {
@@ -2668,9 +2818,27 @@
         searchPageHelper.getAllCoupon();
         // // 搜索页按钮组渲染
         searchPageHelper.btnsRender();
-        // // 定时上色
+        // // 使用 MutationObserver 代替 setInterval 进行上色
         if (!catalogBrandColorTaskIsStartStatus) {
-            setInterval(SearchPageHelper.catalogBrandColor, 3000);
+            const debouncedColor = debounce(SearchPageHelper.catalogBrandColor, 500);
+
+            // 先执行一次
+            SearchPageHelper.catalogBrandColor();
+
+            // 监听DOM变化
+            catalogBrandColorObserver = new MutationObserver((mutations) => {
+                // 只在有新增节点时执行
+                const hasNewNodes = mutations.some(m => m.addedNodes.length > 0);
+                if (hasNewNodes) {
+                    debouncedColor();
+                }
+            });
+
+            catalogBrandColorObserver.observe(document.body, {
+                childList: true,
+                subtree: true
+            });
+
             catalogBrandColorTaskIsStartStatus = true;
         }
 
